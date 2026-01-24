@@ -12,9 +12,14 @@ package com.redhat.devtools.lsp4ij.dap.client;
 
 import com.intellij.icons.AllIcons;
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.fileEditor.FileEditorManager;
-import com.intellij.openapi.vfs.VfsUtil;
+import com.intellij.openapi.fileEditor.FileDocumentManager;
+import com.intellij.openapi.fileEditor.OpenFileDescriptor;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.pom.Navigatable;
 import com.intellij.ui.ColoredTextContainer;
 import com.intellij.ui.SimpleTextAttributes;
 import com.intellij.xdebugger.XDebuggerBundle;
@@ -24,6 +29,7 @@ import com.intellij.xdebugger.evaluation.XDebuggerEvaluator;
 import com.intellij.xdebugger.frame.XCompositeNode;
 import com.intellij.xdebugger.frame.XStackFrame;
 import com.intellij.xdebugger.frame.XValueChildrenList;
+import com.intellij.xdebugger.impl.XSourcePositionEx;
 import com.redhat.devtools.lsp4ij.dap.client.files.DAPFileRegistry;
 import com.redhat.devtools.lsp4ij.dap.client.files.DAPSourceReferencePosition;
 import com.redhat.devtools.lsp4ij.dap.client.variables.DAPValueGroup;
@@ -31,6 +37,9 @@ import com.redhat.devtools.lsp4ij.dap.client.variables.providers.DebugVariableCo
 import com.redhat.devtools.lsp4ij.dap.disassembly.DisassemblyDeferredSourcePosition;
 import com.redhat.devtools.lsp4ij.dap.evaluation.DAPDebuggerEvaluator;
 import com.redhat.devtools.lsp4ij.internal.StringUtils;
+import kotlinx.coroutines.flow.Flow;
+import kotlinx.coroutines.flow.MutableStateFlow;
+import kotlinx.coroutines.flow.StateFlowKt;
 import org.eclipse.lsp4j.debug.*;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -48,7 +57,7 @@ public class DAPStackFrame extends XStackFrame {
 
     private final @NotNull StackFrame stackFrame;
     private final @NotNull DAPClient client;
-    private @Nullable XSourcePosition sourcePosition;
+    private volatile @Nullable XSourcePosition sourcePosition;
     private @Nullable DisassemblyDeferredSourcePosition disassemblyInstructionSourcePosition;
     private XDebuggerEvaluator evaluator;
     private CompletableFuture<DebugVariableContext> variablesContext;
@@ -79,17 +88,24 @@ public class DAPStackFrame extends XStackFrame {
 
     @Override
     public @Nullable XSourcePosition getSourcePosition() {
-        var source = stackFrame.getSource();
-        if (sourcePosition == null && source != null) {
-            sourcePosition = doGetSourcePosition(source, stackFrame.getLine() - 1);
+        XSourcePosition cached = sourcePosition;
+        if (cached != null) {
+            return cached;
         }
+
+        var source = stackFrame.getSource();
+        if (source == null) {
+            return null;
+        }
+
+        sourcePosition = doGetSourcePosition(source, stackFrame.getLine() - 1);
         return sourcePosition;
     }
 
     private @Nullable XSourcePosition doGetSourcePosition(@NotNull Source source, int line) {
         int sourceReference = source.getSourceReference() != null ? source.getSourceReference() : 0;
         if (sourceReference > 0) {
-            // If the value &gt; 0 the contents of the source must be retrieved through
+            // If the value > 0 the contents of the source must be retrieved through
             // the SourceRequest (even if a path is specified).
             var file = DAPFileRegistry.getInstance().getOrCreateDAPFile(client.getConfigName(), getValidSourceName(source), client.getProject());
             if (file.shouldReload(getClient().getSessionId())) {
@@ -102,14 +118,77 @@ public class DAPStackFrame extends XStackFrame {
         if (filePath == null) {
             return null;
         }
-        try {
-            VirtualFile file = VfsUtil.findFile(filePath, true);
-            return XDebuggerUtil.getInstance().createPosition(file, line);
-        } catch (Exception e) {
-            // Invalid path...
-            // ex: <node_internals>/internal/modules/cjs/loader
+
+        VirtualFile file = LocalFileSystem.getInstance().findFileByPath(filePath.toString());
+        if (file == null || !file.isValid()) {
+            return null;
         }
-        return null;
+
+        if (ApplicationManager.getApplication().isDispatchThread()) {
+            return new DeferredLocalFileSourcePosition(file, line);
+        }
+
+        return XDebuggerUtil.getInstance().createPosition(file, line);
+    }
+
+    private static final class DeferredLocalFileSourcePosition implements XSourcePositionEx {
+        private final @NotNull VirtualFile file;
+        private final int line;
+        private final @NotNull MutableStateFlow<Boolean> positionUpdateFlow = StateFlowKt.MutableStateFlow(false);
+        private volatile int offset = -1;
+
+        private DeferredLocalFileSourcePosition(@NotNull VirtualFile file, int line) {
+            this.file = file;
+            this.line = line;
+            // `getSourcePosition()` may be called on EDT; precompute offset in background and notify the debugger UI.
+            ApplicationManager.getApplication().executeOnPooledThread(() -> {
+                int resolvedOffset = com.intellij.openapi.application.ReadAction.compute(() -> computeOffset(file, line));
+                offset = resolvedOffset;
+                positionUpdateFlow.setValue(true);
+            });
+        }
+
+        @Override
+        public int getLine() {
+            return line;
+        }
+
+        @Override
+        public int getOffset() {
+            return offset;
+        }
+
+        @Override
+        public @NotNull VirtualFile getFile() {
+            return file;
+        }
+
+        @Override
+        public @NotNull Navigatable createNavigatable(@NotNull Project project) {
+            int resolvedOffset = offset;
+            if (resolvedOffset >= 0) {
+                return new OpenFileDescriptor(project, file, resolvedOffset);
+            }
+            return new OpenFileDescriptor(project, file, Math.max(0, line), 0);
+        }
+
+        @Override
+        public @NotNull Flow<Boolean> getPositionUpdateFlow() {
+            return positionUpdateFlow;
+        }
+
+        private static int computeOffset(@NotNull VirtualFile file, int line) {
+            Document document = FileDocumentManager.getInstance().getDocument(file);
+            if (document == null) {
+                return -1;
+            }
+            int l = Math.max(0, line);
+            int offset = l < document.getLineCount() ? document.getLineStartOffset(l) : -1;
+            if (offset >= document.getTextLength()) {
+                offset = document.getTextLength() - 1;
+            }
+            return offset;
+        }
     }
 
     public CompletableFuture<XSourcePosition> getSourcePositionFor(@NotNull Variable variable) {
